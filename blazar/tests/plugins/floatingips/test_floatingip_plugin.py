@@ -44,6 +44,7 @@ class FloatingIpPluginTest(tests.TestCase):
         self.db_api = db_api
         self.db_utils = db_utils
         self.fip_pool = self.patch(neutron, 'FloatingIPPool')
+        self.fip_plugin = floatingip_plugin.FloatingIpPlugin()
 
     def test_create_floatingip(self):
         m = mock.MagicMock()
@@ -481,3 +482,195 @@ class FloatingIpPluginTest(tests.TestCase):
                           'network-id', [], 2,
                           datetime.datetime(2013, 12, 19, 20, 0),
                           datetime.datetime(2013, 12, 19, 21, 0))
+
+    def test_update_reservation_shorten(self):
+        values = {
+            'start_date': datetime.datetime(2020, 1, 1, 20, 30),
+            'end_date': datetime.datetime(2020, 1, 1, 21, 0)
+        }
+        reservation_get = self.patch(self.db_api, 'reservation_get')
+        reservation_get.return_value = {
+            'lease_id': u'10870923-6d56-45c9-b592-f788053f5baa',
+        }
+        lease_get = self.patch(self.db_api, 'lease_get')
+        lease_get.return_value = {
+            'start_date': datetime.datetime(2020, 1, 1, 20, 0),
+            'end_date': datetime.datetime(2020, 1, 1, 21, 0)
+        }
+        fip_reservation_get = self.patch(self.db_api, 'fip_reservation_get')
+        self.fip_plugin.update_reservation(
+            '706eb3bc-07ed-4383-be93-b32845ece672',
+            values)
+        reservation_get.assert_called_once_with(
+            '706eb3bc-07ed-4383-be93-b32845ece672')
+        lease_get.assert_called_once_with(
+            '10870923-6d56-45c9-b592-f788053f5baa')
+        fip_reservation_get.assert_not_called()
+
+    def test_update_reservation_extend(self):
+        values = {
+            'start_date': datetime.datetime(2020, 1, 1, 20, 0),
+            'end_date': datetime.datetime(2020, 1, 1, 21, 30)
+        }
+        reservation_get = self.patch(self.db_api, 'reservation_get')
+        reservation_get.return_value = {
+            'lease_id': u'10870923-6d56-45c9-b592-f788053f5baa',
+            'resource_id': u'91253650-cc34-4c4f-bbe8-c943aa7d0c9b',
+            'status': 'pending'
+        }
+        lease_get = self.patch(self.db_api, 'lease_get')
+        lease_get.return_value = {
+            'start_date': datetime.datetime(2020, 1, 1, 20, 0),
+            'end_date': datetime.datetime(2020, 1, 1, 21, 0)
+        }
+        fip_reservation_get = self.patch(self.db_api, 'fip_reservation_get')
+        fip_reservation_get.return_value = {
+            'network_id': 'network-id1',
+            'floating_ip_address': None
+        }
+        fip_allocation_get_all = self.patch(
+            self.db_api, 'fip_allocation_get_all_by_values')
+        fip_allocation_get_all.return_value = [
+            {
+                'id': u'dd305477-4df8-4547-87f6-69069ee546a6',
+                'floatingip_id': 'fip-id1',
+            }
+        ]
+        fip_get_all_by_queries = self.patch(
+            self.db_api, 'reservable_fip_get_all_by_queries')
+        fip_get_all_by_queries.return_value = [{'id': 'fip-id1'}]
+        get_reserved_periods = self.patch(self.db_utils,
+                                          'get_reserved_periods')
+        get_reserved_periods.return_value = [
+            (datetime.datetime(2020, 1, 1, 20, 0),
+             datetime.datetime(2020, 1, 1, 21, 0))
+        ]
+        fip_allocation_create = self.patch(
+            self.db_api, 'fip_allocation_create')
+        fip_allocation_destroy = self.patch(
+            self.db_api, 'fip_allocation_destroy')
+
+        self.fip_plugin.update_reservation(
+            '706eb3bc-07ed-4383-be93-b32845ece672',
+            values)
+
+        query = ['network_id == network-id1']
+        fip_get_all_by_queries.assert_called_once_with(query)
+        get_reserved_periods.assert_called_once_with(
+            'fip-id1',
+            datetime.datetime(2020, 1, 1, 20, 0),
+            datetime.datetime(2020, 1, 1, 21, 30),
+            datetime.timedelta(seconds=1),
+            resource_type='floatingip'
+        )
+        fip_allocation_create.assert_not_called()
+        fip_allocation_destroy.assert_not_called()
+
+    def test_update_reservation_change_in_active(self):
+        values = {
+            'start_date': datetime.datetime(2020, 1, 20, 20, 0),
+            'end_date': datetime.datetime(2020, 1, 20, 21, 30)
+        }
+        reservation_get = self.patch(self.db_api, 'reservation_get')
+        reservation_get.return_value = {
+            'lease_id': u'10870923-6d56-45c9-b592-f788053f5baa',
+            'resource_id': u'91253650-cc34-4c4f-bbe8-c943aa7d0c9b',
+            'status': 'active'
+        }
+        lease_get = self.patch(self.db_api, 'lease_get')
+        lease_get.return_value = {
+            'start_date': datetime.datetime(2020, 1, 19, 20, 0),
+            'end_date': datetime.datetime(2020, 1, 19, 21, 0)
+        }
+        fip_reservation_get = self.patch(
+            self.db_api,
+            'fip_reservation_get')
+        fip_reservation_get.return_value = {
+            'network_id': 'network-id1',
+            'floating_ip_address': None
+        }
+        fip_allocation_get_all = self.patch(
+            self.db_api,
+            'fip_allocation_get_all_by_values')
+        fip_allocation_get_all.return_value = [
+            {
+                'id': u'dd305477-4df8-4547-87f6-69069ee546a6',
+                'floatingip_id': 'fip-id1'
+            }
+        ]
+        fip_get_all_by_queries = self.patch(
+            self.db_api, 'reservable_fip_get_all_by_queries')
+        fip_get_all_by_queries.return_value = [{'id': 'fip-id1'}]
+        get_reserved_periods = self.patch(self.db_utils,
+                                          'get_reserved_periods')
+        get_reserved_periods.return_value = [
+            (datetime.datetime(2020, 1, 20, 20, 30),
+             datetime.datetime(2020, 1, 20, 21, 0))
+        ]
+        matching_fips = self.patch(self.fip_plugin, '_matching_fips')
+        self.assertRaises(
+            mgr_exceptions.NotEnoughFloatingIPAvailable,
+            self.fip_plugin.update_reservation,
+            '706eb3bc-07ed-4383-be93-b32845ece672',
+            values)
+        matching_fips.assert_not_called()
+
+    def test_update_reservation_change_resource(self):
+        values = {
+            'start_date': datetime.datetime(2020, 12, 20, 20, 0),
+            'end_date': datetime.datetime(2020, 12, 20, 21, 30)
+        }
+        reservation_get = self.patch(self.db_api, 'reservation_get')
+        reservation_get.return_value = {
+            'lease_id': u'10870923-6d56-45c9-b592-f788053f5baa',
+            'resource_id': u'91253650-cc34-4c4f-bbe8-c943aa7d0c9b',
+            'status': 'pending'
+        }
+        lease_get = self.patch(self.db_api, 'lease_get')
+        lease_get.return_value = {
+            'start_date': datetime.datetime(2020, 12, 19, 20, 0),
+            'end_date': datetime.datetime(2020, 12, 19, 21, 0)
+        }
+        fip_reservation_get = self.patch(
+            self.db_api, 'fip_reservation_get')
+        fip_reservation_get.return_value = {
+            'network_id': 'network-id1',
+            'floating_ip_address': None
+        }
+        fip_allocation_get_all = self.patch(
+            self.db_api, 'fip_allocation_get_all_by_values')
+        fip_allocation_get_all.return_value = [
+            {
+                'id': u'dd305477-4df8-4547-87f6-69069ee546a6',
+                'floatingip_id': 'fip-id1'
+            }
+        ]
+        fip_get_all_by_queries = self.patch(
+            self.db_api, 'reservable_fip_get_all_by_queries')
+        fip_get_all_by_queries.return_value = [{'id': 'fip-id1'},
+                                               {'id': 'fip-id2'}]
+        fip_allocation_create = self.patch(
+            self.db_api, 'fip_allocation_create')
+        fip_allocation_destroy = self.patch(
+            self.db_api, 'fip_allocation_destroy')
+        get_reserved_periods = self.patch(self.db_utils,
+                                          'get_reserved_periods')
+        get_reserved_periods.return_value = [
+            (datetime.datetime(2020, 12, 20, 20, 30),
+             datetime.datetime(2020, 12, 20, 21, 0))
+        ]
+        matching_fips = self.patch(self.fip_plugin, '_matching_fips')
+        matching_fips.return_value = ['fip-id2']
+        self.fip_plugin.update_reservation(
+            '706eb3bc-07ed-4383-be93-b32845ece672',
+            values)
+        fip_reservation_get.assert_called_with(
+            u'91253650-cc34-4c4f-bbe8-c943aa7d0c9b')
+        fip_allocation_destroy.assert_called_with(
+            'dd305477-4df8-4547-87f6-69069ee546a6')
+        fip_allocation_create.assert_called_with(
+            {
+                'floatingip_id': 'fip-id2',
+                'reservation_id': '706eb3bc-07ed-4383-be93-b32845ece672'
+            }
+        )

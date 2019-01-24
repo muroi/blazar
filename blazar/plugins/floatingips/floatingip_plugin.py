@@ -27,6 +27,7 @@ from blazar import exceptions
 from blazar.manager import exceptions as manager_ex
 from blazar.plugins import base
 from blazar.plugins import floatingips as plugin
+from blazar import status
 from blazar.utils.openstack import neutron
 from blazar.utils import plugins as plugins_utils
 
@@ -94,6 +95,97 @@ class FloatingIpPlugin(base.BasePlugin):
             db_api.fip_allocation_create({'floatingip_id': fip_id,
                                           'reservation_id': reservation_id})
         return fip_reservation['id']
+
+    def update_reservation(self, reservation_id, values):
+        reservation = db_api.reservation_get(reservation_id)
+        lease = db_api.lease_get(reservation['lease_id'])
+
+        updatable = ['network_id', 'floating_ip_address']
+        if (not any([k in updatable for k in values.keys()])
+                and values['start_date'] >= lease['start_date']
+                and values['end_date'] <= lease['end_date']):
+            # no update because of just shortening the reservation time
+            return
+
+        dates_before = {'start_date': lease['start_date'],
+                        'end_date': lease['end_date']}
+        dates_after = {'start_date': values['start_date'],
+                       'end_date': values['end_date']}
+
+        fip_reservation = db_api.fip_reservation_get(
+            reservation['resource_id'])
+        self._update_allocations(dates_before, dates_after, reservation_id,
+                                 reservation['status'], fip_reservation,
+                                 values)
+
+        updates = {key: values[key] for key in updatable if key in values}
+        if updates:
+            db_api.fip_reservation_update(fip_reservation['id'], updates)
+
+    def _update_allocations(self, dates_before, dates_after, reservation_id,
+                            reservation_status, fip_reservation, values):
+        network_id = values.get('network_id', fip_reservation['network_id'])
+        fip_address = values.get('floating_ip_address',
+                                 fip_reservation['floating_ip_address'])
+
+        alloc_to_remove = self._allocation_to_remove(
+            dates_before, dates_after, reservation_id, network_id, fip_address)
+
+        # Nothing to update or extending current allocation to new time window.
+        if not alloc_to_remove:
+            return
+
+        if (alloc_to_remove and
+           reservation_status == status.reservation.ACTIVE):
+            raise manager_ex.NotEnoughFloatingIPAvailable()
+
+        floatingip_ids = self._matching_fips(network_id,
+                                             fip_address,
+                                             dates_after['start_date'],
+                                             dates_before['end_date'])
+        if not floatingip_ids:
+            raise manager_ex.NotEnoughFloatingIPAvailable()
+
+        db_api.fip_allocation_create({'floatingip_id': floatingip_ids[0],
+                                      'reservation_id': reservation_id})
+        db_api.fip_allocation_destroy(alloc_to_remove['id'])
+
+    def _allocation_to_remove(self, dates_before, dates_after, reservation_id,
+                              network_id, fip_address):
+        alloc = next(iter(db_api.fip_allocation_get_all_by_values(
+            reservation_id=reservation_id)))
+        fip_ids = [fip['id'] for fip in
+                   self._filter_fips_by_properties(network_id, fip_address)]
+
+        # The update_reservation tries to reserve the same floating IP
+        # if the floating IP is available during the new time window.
+        if alloc['floatingip_id'] in fip_ids:
+            reserved_periods = db_utils.get_reserved_periods(
+                alloc['floatingip_id'],
+                dates_after['start_date'],
+                dates_after['end_date'],
+                datetime.timedelta(seconds=1),
+                resource_type='floatingip')
+
+            max_start = max(dates_before['start_date'],
+                            dates_after['start_date'])
+            min_end = min(dates_before['end_date'],
+                          dates_after['end_date'])
+
+            if (len(reserved_periods) == 0 or
+                (len(reserved_periods) == 1 and
+                 reserved_periods[0][0] == max_start and
+                 reserved_periods[0][1] == min_end)):
+                return []
+        return alloc
+
+    def _filter_fips_by_properties(self, network_id, fip_address):
+        query_filter = plugins_utils.convert_requirements(
+            ['==', '$network_id', network_id])
+        if fip_address:
+            query = ["==", '$floating_ip_address', fip_address]
+            query_filter += plugins_utils.convert_requirements(query)
+        return db_api.reservable_fip_get_all_by_queries(query_filter)
 
     def on_start(self, resource_id):
         fip_reservation = db_api.fip_reservation_get(resource_id)

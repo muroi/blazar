@@ -100,7 +100,7 @@ class FloatingIpPlugin(base.BasePlugin):
         reservation = db_api.reservation_get(reservation_id)
         lease = db_api.lease_get(reservation['lease_id'])
 
-        updatable = ['network_id', 'floating_ip_address']
+        updatable = ['network_id', 'required_floatingips', 'amount']
         if (not any([k in updatable for k in values.keys()])
                 and values['start_date'] >= lease['start_date']
                 and values['end_date'] <= lease['end_date']):
@@ -125,24 +125,60 @@ class FloatingIpPlugin(base.BasePlugin):
     def _update_allocations(self, dates_before, dates_after, reservation_id,
                             reservation_status, fip_reservation, values):
         network_id = values.get('network_id', fip_reservation['network_id'])
-        fip_address = values.get('floating_ip_address',
-                                 fip_reservation['floating_ip_address'])
+        amount = values.get('amount', fip_reservation['amount'])
+        required_floatingips = values.get('required_floatingips',
+                                 fip_reservation['required_floatingips'])
 
+        if amount < len(required_floatingips):
+            raise manager_ex.InvalidRange()
+
+        allocs = db_api.fip_allocation_get_all_by_values(
+            reservation_id=reservation_id)
         alloc_to_remove = self._allocation_to_remove(
-            dates_before, dates_after, reservation_id, network_id, fip_address)
-
-        # Nothing to update or extending current allocation to new time window.
-        if not alloc_to_remove:
-            return
+            dates_before, dates_after, reservation_id,
+            network_id, required_floatingips, amount, allocs)
 
         if (alloc_to_remove and
            reservation_status == status.reservation.ACTIVE):
             raise manager_ex.NotEnoughFloatingIPAvailable()
 
-        floatingip_ids = self._matching_fips(network_id,
-                                             fip_address,
-                                             dates_after['start_date'],
-                                             dates_before['end_date'])
+        # 1. if an allocation for a required_fip is in alloc_to_remove,
+        # raise an NotEnoughFloatingIPAvailable()
+        required_floatingip_ids = []
+        for required_fip in required_floatingips:
+            fip_id = self._filter_fips_by_properties(network_id, required_fip)['id']
+            required_floatingip_ids.append(fip_id)
+
+        for alloc in alloc_to_remove:
+            if alloc['floatingip_id'] in required_floatingip_ids:
+                raise manager_ex.NotEnoughFloatingIPAvailable()
+
+        # 2-1. calucurate lack of required_fips and amount.
+        # 2-2. decreading amount and required_floatingips if the current
+        # allocation remains in the new reservation.
+        # 2-3. get matching_fips
+        allocs_to_remain = [alloc for alloc in allocs
+                            if alloc not in allocs_to_remove]
+
+        for alloc in allocs_to_remain:
+            fip = db_api.get_floatingip(alloc['floatingip_id'])
+            if fip['floating_ip_address'] in required_floatingips:
+                required_floatingips.pop(fip['floating_ip_address'])
+                amount -= 1
+            else:
+                amount -= 1
+
+        if amount > 0:
+            floatingip_ids = self._matching_fips(network_id,
+                                                 required_floatingips,
+                                                 amount,
+                                                 dates_after['start_date'],
+                                                 dates_before['end_date'])
+        else:
+            non_required_fip_allocs = [alloc for alloc in allocs_to_remain
+                                       if alloc['floatingip_id'] not in requiredfip_ids]
+            allocs_to_remove.extend(non_required_fip_allocs[amount])
+
         if not floatingip_ids:
             raise manager_ex.NotEnoughFloatingIPAvailable()
 
@@ -151,33 +187,36 @@ class FloatingIpPlugin(base.BasePlugin):
         db_api.fip_allocation_destroy(alloc_to_remove['id'])
 
     def _allocation_to_remove(self, dates_before, dates_after, reservation_id,
-                              network_id, fip_address):
-        alloc = next(iter(db_api.fip_allocation_get_all_by_values(
-            reservation_id=reservation_id)))
-        fip_ids = [fip['id'] for fip in
-                   self._filter_fips_by_properties(network_id, fip_address)]
+                              network_id, required_fips, amount, allocs):
+        """Returns allocations that will be removed in the new reservation."""
+        fip_reservation = db_api.fip_reservation_get(reservation_id)
 
-        # The update_reservation tries to reserve the same floating IP
-        # if the floating IP is available during the new time window.
-        if alloc['floatingip_id'] in fip_ids:
-            reserved_periods = db_utils.get_reserved_periods(
-                alloc['floatingip_id'],
-                dates_after['start_date'],
-                dates_after['end_date'],
-                datetime.timedelta(seconds=1),
-                resource_type='floatingip')
+        if network_id != fip_reservation['network_id']:
+            # The external network is changed.
+            return allocs
 
-            max_start = max(dates_before['start_date'],
-                            dates_after['start_date'])
-            min_end = min(dates_before['end_date'],
-                          dates_after['end_date'])
+        # allocations that can't extend its reservation time
+        allocs_to_remove = []
+        for alloc in allocs:
+            if (dates_before['start_date'] > dates_after['start_date'] or
+                dates_before['end_date'] < dates_after['end_date']):
+                reserved_periods = db_utils.get_reserved_periods(
+                    alloc['floatingip_id'],
+                    dates_after['start_date'],
+                    dates_after['end_date'],
+                    datetime.timedelta(seconds=1),
+                    resource_type='floatingip')
+                max_start = max(dates_before['start_date'],
+                                dates_after['start_date'])
+                min_end = min(dates_before['end_date'],
+                              dates_after['end_date'])
 
-            if (len(reserved_periods) == 0 or
-                (len(reserved_periods) == 1 and
-                 reserved_periods[0][0] == max_start and
-                 reserved_periods[0][1] == min_end)):
-                return []
-        return alloc
+                if not (len(reserved_periods) == 0 or
+                        (len(reserved_periods) == 1 and
+                         reserved_periods[0][0] == max_start and
+                         reserved_periods[0][1] == min_end)):
+                    allocs_to_remove.append(alloc)
+        return allocs_to_remove
 
     def _filter_fips_by_properties(self, network_id, fip_address):
         query_filter = plugins_utils.convert_requirements(
